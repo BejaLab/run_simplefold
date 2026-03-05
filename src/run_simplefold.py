@@ -18,6 +18,7 @@ import os, sys
 import queue
 import subprocess
 from contextlib import contextmanager
+import decimal
 
 # --- Constants ---
 MODELS = [
@@ -38,8 +39,17 @@ def get_log(log_path):
     finally:
         f.close()
 
+def check_tau(tau):
+    if not type(tau) == decimal.Decimal:
+        return False
+    sign, digits, exponent = tau.as_tuple()
+    return sign == 0 and exponent >= -2 and len(digits) - exponent <= 5
+
+def clean_record_seq(record_seq):
+    return record_seq.upper().strip().replace("*", "").replace("-", "")
+
 def get_hash_and_quote(record):
-    clean_seq = str(record.seq).upper().strip().replace("*", "")
+    clean_seq = str(clean_record_seq(record.seq))
     raw_hash = hashlib.sha256(clean_seq.encode('ascii')).digest()
     return base64.urlsafe_b64encode(raw_hash).decode().rstrip("="), quote(record.id, safe = "-_")
 
@@ -73,7 +83,7 @@ def download_dir(url, output_path):
 def insert_cif_to_db(conn, seq_hash, seed, tau, steps, cif):
     conn.execute(
         "INSERT OR IGNORE INTO simplefold (seq_hash, seed, tau, steps, cif) VALUES (?, ?, ?, ?, ?, ?)",
-        (seq_hash, seed, tau, steps, cif)
+        (seq_hash, seed, str(tau), steps, cif)
     )
     conn.commit()
 
@@ -91,13 +101,10 @@ def data_paths(data_dir):
     plddt_path = ckpt_path / "plddt.ckpt"
     return data_path, ckpt_path, torch_path, cache_path, sf_repo_path, esm_ckpt_path, esm_repo_path, latent_path, plddt_path
 
-def model_paths(model, model_dir):
-    if model != "simplefold_1.6B":
-        dir_path = Path(model_dir).resolve()
-        model_path = dir_path / f"{model}.ckpt"
-    else:
-        model_path = None
-    db_path = dir_path / f"{model}.sq3"
+def model_paths(model, data_dir):
+    data_path = Path(data_dir).resolve()
+    model_path = data_path / "models" / f"{model}.ckpt" if model != "simplefold_1.6B" else None
+    db_path = data_path / "databases" / f"{model}.sq3"
     return model_path, db_path
 
 def launch_init(data_dir):
@@ -131,17 +138,23 @@ def launch_init(data_dir):
 
     print("[✔] General initialization complete.")
 
-def fetch_cif(conn, seq_hash, seed, tau, steps):
-    found = conn.execute("SELECT cif FROM simplefold WHERE seq_hash = ? AND seed = ? AND tau = ? AND steps = ?", (seq_hash, seed, tau, steps)).fetchone()
+def fetch_protein(conn, seq_hash):
+    found = conn.execute("SELECT seq FROM proteins WHERE seq_hash = ?", (seq_hash,)).fetchone()
     return found[0] if found else None
 
-def launch_model(model, model_dir):
-    model_path, db_path = model_paths(model, model_dir)
+def fetch_cif(conn, seq_hash, seed, tau, steps):
+    found = conn.execute("SELECT cif FROM simplefold WHERE seq_hash = ? AND seed = ? AND tau = ? AND steps = ?", (seq_hash, seed, str(tau), steps)).fetchone()
+    return found[0] if found else None
+
+def launch_model(model, data_dir):
+    model_path, db_path = model_paths(model, data_dir)
     model_path.parent.mkdir(parents = True, exist_ok = True)
+    db_path.parent.mkdir(parents = True, exist_ok = True)
 
     print(f"[*] Initializing database at {db_path}")
     with sqlite3.connect(db_path) as conn:
-        conn.execute("CREATE TABLE IF NOT EXISTS simplefold (seq_hash TEXT PRIMARY KEY, seed INT, tau REAL, steps INT, cif TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS simplefold (seq_hash TEXT, seed INT, tau DECIMAL(5,2), steps INT, cif TEXT, PRIMARY KEY (seq_hash, seed, tau, steps))")
+        conn.execute("CREATE TABLE IF NOT EXISTS proteins (seq_hash TEXT PRIMARY KEY, seq TEXT UNIQUE NOT NULL)")
 
     if model_path and not model_path.exists():
         url = f"https://ml-site.cdn-apple.com/models/simplefold/{model}.ckpt"
@@ -197,24 +210,25 @@ def run_gpu_worker(batch, gpu, output_path, data_dir, model, model_path, log, se
             output.append((seq_hash, seq_quote, record, output_cif))
         return output
 
-def launch_run(input_fasta, output_dir, data_dir, model, model_dir, log_file, batch_size, seed, tau, steps, gpus):
+def launch_run(input_fasta, output_dir, data_dir, model, log_file, batch_size, seed, tau, steps, gpus):
 
-    if not gpus:
-        raise ValueError("No GPUs allocated")
+    assert gpus, "No GPUs allocated"
 
-    output_path = Path(output_dir).resolve()
+    print(type(tau))
+    if not check_tau(tau):
+        error(f"--tau must be a non-negative decimal number with at most two digits after the dot", fatal = True)
+    
+    output_path = Path(output_dir).resolve() / model / str(seed)
     output_path.mkdir(parents = True, exist_ok = True)
 
-    model_path, db_path = model_paths(model, model_dir)
+    model_path, db_path = model_paths(model, data_dir)
 
     if not Path(data_dir).exists():
-        raise FileNotFoundError(f"[✘] Data directory {data_dir} not found. Run 'init' mode first.")
-
+        error(f"Data directory {data_dir} not found. Run 'simplefold_init' first", fatal = True)
     if not db_path.exists():
-        raise FileNotFoundError(f"[✘] Database {db_path} not found. Run 'model' mode first.")
-
+        error(f"Database {db_path} not found. Run 'simplefold_init -m' first", fatal = True)
     if model_path and not model_path.exists():
-        raise FileNotFoundError(f"[✘] Model file {model_path} not found. Run 'model' mode first.")
+        error(f"Model file {model_path} not found. Run 'simplefold_init -m' first", fatal = True)
 
     print(f"[*] Checking the fasta file")
     to_analyze = {}
@@ -229,8 +243,7 @@ def launch_run(input_fasta, output_dir, data_dir, model, model_dir, log_file, ba
             else:
                 to_analyze[record.id] = seq_hash, seq_quote
             if record.id in all_ids:
-                print(f"[✘] Duplicated record id {record.id}")
-                sys.exit(1)
+                error(f"Duplicated record id {record.id}", fatal = True)
             all_ids.add(record.id)
     print(f"[✔] A total of {len(all_ids)} sequences, {len(to_analyze)} to analyze")
 
@@ -239,6 +252,7 @@ def launch_run(input_fasta, output_dir, data_dir, model, model_dir, log_file, ba
         for record in SeqIO.parse(input_fasta, "fasta"):
             seq_hash, seq_quote = to_analyze.pop(record.id, (None, None))
             if seq_hash:
+                record.seq = clean_record_seq(record.seq)
                 to_predict[record.id] = seq_hash, seq_quote, record
                 if len(to_predict) == batch_size:
                     yield to_predict
@@ -268,10 +282,8 @@ def launch_run(input_fasta, output_dir, data_dir, model, model_dir, log_file, ba
                 for seq_hash, seq_quote, record, output_cif in future.result():
                     if output_cif:
                         cif = output_cif.read_text() 
-                        conn.execute(
-                            "INSERT OR IGNORE INTO simplefold (seq_hash, seed, tau, steps, cif) VALUES (?, ?, ?, ?, ?)",
-                            (seq_hash, seed, tau, steps, cif)
-                        )
+                        conn.execute("INSERT OR IGNORE INTO proteins VALUES (?, ?)", (seq_hash, str(record.seq)))
+                        conn.execute("INSERT OR IGNORE INTO simplefold VALUES (?, ?, ?, ?, ?)", (seq_hash, seed, str(tau), steps, cif))
                         successes.add(record.id)
                 conn.commit()
         return futures, successes
@@ -293,60 +305,81 @@ def launch_run(input_fasta, output_dir, data_dir, model, model_dir, log_file, ba
         progress_bar.update(len(successes))
         ok = True
         for name in all_names - success_names:
-            print(f"[✘] No structure produced for {name}")
+            error(f"No structure produced for {name}")
             ok = False
         if not ok:
-            sys.exit(1)
+            error("Something went wrong", fatal = True)
     print(f"[✔] All done")
 
+def launch_select(input_dir, output_dir, soft_link):
+    import gemmi
 
-# --- Main CLI Entry ---
+    files = {}
+    input_dir_path = Path(input_dir)
+    output_dir_path = Path(output_dir)
+    output_dir_path.mkdir(parents = True, exist_ok = True)
 
-def main():
+    for cif_path in input_dir_path.rglob("*.cif"):
+        doc = gemmi.cif.read_file(str(cif_path))
+        atoms = doc[0].find('_atom_site.', [ 'B_iso_or_equiv' ])
+        plddts = [ float(a[col]) for a in atoms ]
+        score = sum(plddts) / len(plddts)
+        if cif_file.name not in files or files[cif_file.name][0] < score:
+            files[cif_file.name] = score, cif_path
+    for file_name, (score, source_path) in files.items():
+        output_path = output_dir_path / file_name
+        if soft_link:
+            output_path.symlink_to(source_path.relative_to(output_dir_path))
+        else:
+            shutil.copy(source_path, output_path)
 
-    def set_of_int(arg):
+def error(msg, fatal = False):
+    print(f"[✘] {msg}")
+    if fatal:
+        sys.exit(1)
+
+# --- CLI Entries ---
+
+def init_cli():
+    parser = argparse.ArgumentParser(description = "SimpleFold wrapper: Initialize")
+    parser.add_argument("-D", "--data-dir", required = True, help = "Base directory for data")
+    parser.add_argument("-m", "--model", choices = MODELS, help = "Model name (optional)")
+    args = parser.parse_args()
+    launch_init(args.data_dir)
+    if args.model:
+        launch_model(args.model, args.data_dir)
+
+def run_cli():
+    def set_of_int_arg(arg):
         return set(int(x) for x in arg.split(','))
+    def tau_arg(arg):
+        tau = decimal.Decimal(arg)
+        if check_tau(tau):
+            return tau
+        else:
+            raise argparse.ArgumentTypeError(f"--tau must be a non-negative decimal number with at most two digits after the dot")
 
-    parser = argparse.ArgumentParser(description = "SimpleFold wrapper")
-    
-    # --- General Arguments ---
-    parser.add_argument("mode", choices = ["init", "model", "run"], help = "Execution mode")
+    parser = argparse.ArgumentParser(description = "SimpleFold wrapper: Run")
+    parser.add_argument("-i", "--input", required = True, help = "Path to input sequences")
+    parser.add_argument("-O", "--output", required = True, help = "Output directory")
+    parser.add_argument("-D", "--data-dir", required = True, help = "Base directory for data")
+    parser.add_argument("-m", "--model", required = True, choices = MODELS, help = "Model name to use for inference")
+    parser.add_argument("-g", "--gpus", type = set_of_int_arg, default = [0], help = "GPU indices to use")
+    parser.add_argument("-s", "--seed", type = int, default = 123, help = "Seed")
+    parser.add_argument("-b", "--batch", type = int, default = 100, help = "Batch size")
+    parser.add_argument("-l", "--log", type = str, help = "Raw log file")
+    parser.add_argument("--tau", type = tau_arg, default = decimal.Decimal("0.1"))
+    parser.add_argument("--steps", type = int, default = 500)
+    args = parser.parse_args()
+    launch_run(
+        args.input, args.output, args.data_dir, args.model, args.log,
+        batch_size = args.batch, seed = args.seed, tau = args.tau, steps = args.steps, gpus = args.gpus
+    )
 
-    # --- Mode-Specific Arguments ---
-    # Note: Using parse_known_args or separate logic to handle mode-specific requirements
-    args, remaining = parser.parse_known_args()
-
-    if args.mode == "init":
-        init_parser = argparse.ArgumentParser(add_help = False)
-        init_parser.add_argument("-D", "--data-dir", required = True, help = "Base directory for data")
-        init_args = init_parser.parse_args(remaining, namespace = args)
-        launch_init(init_args.data_dir)
-
-    elif args.mode == "model":
-        model_parser = argparse.ArgumentParser(add_help = False)
-        model_parser.add_argument("-m", "--model", required = True, choices = MODELS, help = "Model name to initialize")
-        model_parser.add_argument("-M", "--model-dir", required = True, help = "Directory where the model checkpoint should be stored")
-        model_args = model_parser.parse_args(remaining, namespace = args)
-        launch_model(model_args.model, model_args.model_dir)
-
-    elif args.mode == "run":
-        run_parser = argparse.ArgumentParser(add_help = False)
-        run_parser.add_argument("-i", "--input", required = True, help = "Path to input sequences")
-        run_parser.add_argument("-O", "--output", required = True, help = "Output directory")
-        run_parser.add_argument("-m", "--model", required = True, choices = MODELS, help = "Model name to use for inference")
-        run_parser.add_argument("-M", "--model-dir", required = True, help = "Directory with the model checkpoint file")
-        run_parser.add_argument("-D", "--data-dir", required = True, help = "Base directory for data")
-        run_parser.add_argument("-g", "--gpus", type = set_of_int, default = [0], help = "GPU indices to use")
-        run_parser.add_argument("-s", "--seed", type = int, default = 123, help = "Seed")
-        run_parser.add_argument("-b", "--batch", type = int, default = 100, help = "Batch size")
-        run_parser.add_argument("-l", "--log", type = str, help = "Raw log file")
-        run_parser.add_argument("--tau", type = float, default = 0.1)
-        run_parser.add_argument("--steps", type = int, default = 500)
-        run_args = run_parser.parse_args(remaining, namespace = args)
-        launch_run(
-            run_args.input, run_args.output, run_args.data_dir, run_args.model, run_args.model_dir, run_args.log,
-            batch_size = run_args.batch, seed = run_args.seed, tau = run_args.tau, steps = run_args.steps, gpus = run_args.gpus
-        )
-
-if __name__ == "__main__":
-    main()
+def select_cli():
+    parser = argparse.ArgumentParser(description = "SimpleFold wrapper: Select")
+    parser.add_argument("-I", "--input", required = True, help = "Directory containing 'run' outputs")
+    parser.add_argument("-O", "--output", required = True, help = "Output directory for the best models")
+    parser.add_argument("-l", "--soft-link", action = 'store_true', help = 'Soft link instead of hard copy')
+    args = parser.parse_args()
+    launch_select(args.input, args.output, args.soft_link)
