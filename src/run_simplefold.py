@@ -138,10 +138,6 @@ def launch_init(data_dir):
 
     print("[✔] General initialization complete.")
 
-def fetch_protein(conn, seq_hash):
-    found = conn.execute("SELECT seq FROM proteins WHERE seq_hash = ?", (seq_hash,)).fetchone()
-    return found[0] if found else None
-
 def fetch_cif(conn, seq_hash, seed, tau, steps):
     found = conn.execute("SELECT cif FROM simplefold WHERE seq_hash = ? AND seed = ? AND tau = ? AND steps = ?", (seq_hash, seed, str(tau), steps)).fetchone()
     return found[0] if found else None
@@ -214,7 +210,6 @@ def launch_run(input_fasta, output_dir, data_dir, model, log_file, batch_size, s
 
     assert gpus, "No GPUs allocated"
 
-    print(type(tau))
     if not check_tau(tau):
         error(f"--tau must be a non-negative decimal number with at most two digits after the dot", fatal = True)
     
@@ -269,7 +264,7 @@ def launch_run(input_fasta, output_dir, data_dir, model, log_file, batch_size, s
         try:
             return run_gpu_worker(batch, gpu, output_path, data_dir, model, model_path, log, seed, tau, steps)
         except Exception as e:
-            print(f"[✘] Got exception: {e}")
+            error(f"Got exception: {e}")
         finally:
             gpu_queue.put(gpu)
 
@@ -311,23 +306,29 @@ def launch_run(input_fasta, output_dir, data_dir, model, log_file, batch_size, s
             error("Something went wrong", fatal = True)
     print(f"[✔] All done")
 
-def launch_select(input_dir, output_dir, soft_link):
-    import gemmi
+def launch_select(input_dir, output_dir, soft_link, no_seed_suffix = False):
+    import gemmi, re
 
     files = {}
     input_dir_path = Path(input_dir)
     output_dir_path = Path(output_dir)
     output_dir_path.mkdir(parents = True, exist_ok = True)
 
+    seed_re = re.compile(r'_[0-9]+$')
+    trim_seed_suffix = not no_seed_suffix
+    col = 'B_iso_or_equiv'
     for cif_path in input_dir_path.rglob("*.cif"):
         doc = gemmi.cif.read_file(str(cif_path))
-        atoms = doc[0].find('_atom_site.', [ 'B_iso_or_equiv' ])
+        atoms = doc[0].find('_atom_site.', [ col ])
         plddts = [ float(a[col]) for a in atoms ]
         score = sum(plddts) / len(plddts)
-        if cif_file.name not in files or files[cif_file.name][0] < score:
-            files[cif_file.name] = score, cif_path
-    for file_name, (score, source_path) in files.items():
-        output_path = output_dir_path / file_name
+        name = cif_path.stem
+        if trim_seed_suffix:
+            name = seed_re.sub('', name)
+        if name not in files or files[name][0] < score:
+            files[name] = score, cif_path
+    for name, (score, source_path) in files.items():
+        output_path = output_dir_path / f"{name}.cif"
         if soft_link:
             output_path.symlink_to(source_path.relative_to(output_dir_path))
         else:
@@ -350,8 +351,8 @@ def init_cli():
         launch_model(args.model, args.data_dir)
 
 def run_cli():
-    def set_of_int_arg(arg):
-        return set(int(x) for x in arg.split(','))
+    def list_of_int_arg(arg):
+        return [ int(x) for x in arg.split(',') ]
     def tau_arg(arg):
         tau = decimal.Decimal(arg)
         if check_tau(tau):
@@ -364,22 +365,25 @@ def run_cli():
     parser.add_argument("-O", "--output", required = True, help = "Output directory")
     parser.add_argument("-D", "--data-dir", required = True, help = "Base directory for data")
     parser.add_argument("-m", "--model", required = True, choices = MODELS, help = "Model name to use for inference")
-    parser.add_argument("-g", "--gpus", type = set_of_int_arg, default = [0], help = "GPU indices to use")
-    parser.add_argument("-s", "--seed", type = int, default = 123, help = "Seed")
+    parser.add_argument("-g", "--gpus", type = list_of_int_arg, default = [0], help = "GPU indices to use")
+    parser.add_argument("-s", "--seeds", type = list_of_int_arg, default = [123], help = "Seeds")
     parser.add_argument("-b", "--batch", type = int, default = 100, help = "Batch size")
     parser.add_argument("-l", "--log", type = str, help = "Raw log file")
     parser.add_argument("--tau", type = tau_arg, default = decimal.Decimal("0.1"))
     parser.add_argument("--steps", type = int, default = 500)
     args = parser.parse_args()
-    launch_run(
-        args.input, args.output, args.data_dir, args.model, args.log,
-        batch_size = args.batch, seed = args.seed, tau = args.tau, steps = args.steps, gpus = args.gpus
-    )
+    for seed in args.seeds:
+        print(f"Starting with seed {seed}...")
+        launch_run(
+            args.input, args.output, args.data_dir, args.model, args.log,
+            batch_size = args.batch, seed = seed, tau = args.tau, steps = args.steps, gpus = args.gpus
+        )
 
 def select_cli():
     parser = argparse.ArgumentParser(description = "SimpleFold wrapper: Select")
     parser.add_argument("-I", "--input", required = True, help = "Directory containing 'run' outputs")
     parser.add_argument("-O", "--output", required = True, help = "Output directory for the best models")
-    parser.add_argument("-l", "--soft-link", action = 'store_true', help = 'Soft link instead of hard copy')
+    parser.add_argument("-l", "--soft-link", action = 'store_true', help = "Soft link instead of hard copy")
+    parser.add_argument("--no-seed-suffix", action = 'store_true', help = "The input files do not contain the seed as the suffix")
     args = parser.parse_args()
-    launch_select(args.input, args.output, args.soft_link)
+    launch_select(args.input, args.output, args.soft_link, no_seed_suffix = args.no_seed_suffix)
