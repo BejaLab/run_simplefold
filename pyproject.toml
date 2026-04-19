@@ -19,8 +19,7 @@ classifiers = [
 dependencies = [
     "gemmi==0.7.3",
     "tqdm==4.67.2",
-    "biopython==1.85",
-    "simplefold @ git+https://github.com/apple/ml-simplefold"
+    "biopython==1.85"
 ]
 [project.urls]
 "Homepage" = "https://github.com/BejaLab/run_simplefold"

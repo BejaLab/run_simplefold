@@ -3,6 +3,14 @@ simplefold
 
 SimpleFold wrapper.
 
+Installation
+------------
+
+```
+pip install git+https://github.com/apple/ml-simplefold
+pip install git+https://github.com/BejaLab/run_simplefold
+```
+
 simplefold\_init
 ----------------
 
@@ -51,7 +59,7 @@ simplefold\_select
 ------------------
 
 ```
-usage: simplefold_select [-h] -I INPUT -O OUTPUT [-l]
+usage: simplefold_select [-h] -I INPUT -O OUTPUT [-l] [--no-seed-suffix]
 
 SimpleFold wrapper: Select
 
@@ -62,4 +70,5 @@ options:
   -O OUTPUT, --output OUTPUT
                         Output directory for the best models
   -l, --soft-link       Soft link instead of hard copy
+  --no-seed-suffix      The input files do not contain the seed as the suffix
 ```
