@@ -11,6 +11,21 @@ pip install git+https://github.com/apple/ml-simplefold
 pip install git+https://github.com/BejaLab/run_simplefold
 ```
 
+How to use
+----------
+
+```
+#
+# Initialize the model files and the database
+simplefold_init -D data_dir -m simplefold_360M
+#
+# Run the inference using a set of seeds
+simplefold_run -D data_dir -m simplefold_360M -i path/to/input.fasta -O path/to/run/ -g 0,1 -s 234,9,103,60,5,79,232,229,45,51 -l path/to/log.txt
+#
+# Select the best structure per protein
+simplefold_select -I path/to/run/ -O path/to/select/
+```
+
 simplefold\_init
 ----------------
 
