@@ -6,9 +6,10 @@ SimpleFold wrapper.
 Installation
 ------------
 
+In an environmental with `python3.10`:
+
 ```
-pip install git+https://github.com/apple/ml-simplefold
-pip install git+https://github.com/BejaLab/run_simplefold
+pip install git+https://github.com/apple/ml-simplefold git+https://github.com/BejaLab/run_simplefold
 ```
 
 How to use
