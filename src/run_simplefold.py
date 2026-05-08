@@ -20,11 +20,60 @@ import subprocess
 from contextlib import contextmanager
 import decimal
 
+# --- Logging functions
+def message(msg):
+    print(f"[*] {msg}", file = sys.stderr)
+
+def ok(msg):
+    print(f"[✔] {msg}", file = sys.stderr)
+
+def warning(msg):
+    print(f"[!] {msg}", file = sys.stderr)
+
+def error(msg, exception = None, fatal = True):
+    print(f"[✘] {msg}", file = sys.stderr)
+    if exception:
+        print(f"[✘] {exception}", file = sys.stderr)
+    if fatal:
+        sys.exit(1)
+
+# --- Handle GPUs ---
+
+def get_framework_gpu_count():
+    import importlib.util
+    def is_installed(package_name):
+        return importlib.util.find_spec(package_name) is not None
+    if is_installed("torch"):
+        import torch
+        return torch.cuda.device_count()
+    if is_installed("tensorflow"):
+        os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+        import tensorflow as tf
+        gpus = tf.config.list_physical_devices('GPU')
+        return len(gpus)
+    return 0
+
+def default_gpus():
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cuda_visible_devices is not None:
+        if cuda_visible_devices.strip() in ("", "-1"):
+            return []
+        return [x.strip() for x in cuda_visible_devices.split(",")]
+    num_gpus = get_framework_gpu_count()
+    return [str(i) for i in range(num_gpus)]
+
 # --- Constants ---
 MODELS = [
     'simplefold_100M', 'simplefold_360M', 'simplefold_700M', 
     'simplefold_1.1B', 'simplefold_1.6B', 'simplefold_3B'
 ]
+
+DEF_GPUS = default_gpus()
+DEF_TAU = decimal.Decimal("0.1")
+DEF_BATCH = 100
+DEF_SEEDS = [123]
+DEF_MODEL = 'simplefold_360M'
+DEF_STEPS = 500
 
 # --- Helper Functions ---
 
@@ -264,7 +313,7 @@ def launch_run(input_fasta, output_dir, data_dir, model, log_file, batch_size, s
         try:
             return run_gpu_worker(batch, gpu, output_path, data_dir, model, model_path, log, seed, tau, steps)
         except Exception as e:
-            error(f"Got exception: {e}")
+            error(f"Got exception", e, fatal = False)
         finally:
             gpu_queue.put(gpu)
 
@@ -300,10 +349,10 @@ def launch_run(input_fasta, output_dir, data_dir, model, log_file, batch_size, s
         progress_bar.update(len(successes))
         ok = True
         for name in all_names - success_names:
-            error(f"No structure produced for {name}")
+            error(f"No structure produced for {name}", fatal = False)
             ok = False
         if not ok:
-            error("Something went wrong", fatal = True)
+            error("Something went wrong")
     print(f"[✔] All done")
 
 def launch_select(input_dir, output_dir, soft_link, no_seed_suffix = False):
@@ -334,11 +383,6 @@ def launch_select(input_dir, output_dir, soft_link, no_seed_suffix = False):
         else:
             shutil.copy(source_path, output_path)
 
-def error(msg, fatal = False):
-    print(f"[✘] {msg}")
-    if fatal:
-        sys.exit(1)
-
 # --- CLI Entries ---
 
 def init_cli():
@@ -353,6 +397,8 @@ def init_cli():
 def run_cli():
     def list_of_int_arg(arg):
         return [ int(x) for x in arg.split(',') ]
+    def list_of_str_arg(arg):
+        return [x.strip() for x in arg.split(',')]
     def tau_arg(arg):
         tau = decimal.Decimal(arg)
         if check_tau(tau):
@@ -364,13 +410,13 @@ def run_cli():
     parser.add_argument("-i", "--input", required = True, help = "Path to input sequences")
     parser.add_argument("-O", "--output", required = True, help = "Output directory")
     parser.add_argument("-D", "--data-dir", required = True, help = "Base directory for data")
-    parser.add_argument("-m", "--model", required = True, choices = MODELS, help = "Model name to use for inference")
-    parser.add_argument("-g", "--gpus", type = list_of_int_arg, default = [0], help = "GPU indices to use")
-    parser.add_argument("-s", "--seeds", type = list_of_int_arg, default = [123], help = "Seeds")
-    parser.add_argument("-b", "--batch", type = int, default = 100, help = "Batch size")
+    parser.add_argument("-m", "--model", required = True, choices = MODELS, default = DEF_MODEL, help = f"Model name to use for inference [{DEF_MODEL}]")
+    parser.add_argument("-g", "--gpus", type=list_of_str_arg, default = DEF_GPUS, help=f"GPUs to use [{','.join(DEF_GPUS)}]")
+    parser.add_argument("-s", "--seeds", type = list_of_int_arg, default = DEF_SEEDS, help = f"Seeds [{','.join(map(str, DEF_SEEDS))}]")
+    parser.add_argument("-b", "--batch", type = int, default = DEF_BATCH, help = f"Batch size [{DEF_BATCH}]")
     parser.add_argument("-l", "--log", type = str, help = "Raw log file")
-    parser.add_argument("--tau", type = tau_arg, default = decimal.Decimal("0.1"))
-    parser.add_argument("--steps", type = int, default = 500)
+    parser.add_argument("--tau", type = tau_arg, default = DEF_TAU, help = f"Tau [{DEF_TAU}]")
+    parser.add_argument("--steps", type = int, default = DEF_STEPS, help = f"Number of steps [{DEF_STEPS}]")
     args = parser.parse_args()
     for seed in args.seeds:
         print(f"Starting with seed {seed}...")
