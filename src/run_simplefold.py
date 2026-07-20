@@ -97,10 +97,11 @@ def check_tau(tau):
 def clean_record_seq(record_seq):
     return record_seq.upper().strip().replace("*", "").replace("-", "")
 
-def get_hash_and_quote(record):
+def get_hash_and_quote(record, desc):
     clean_seq = str(clean_record_seq(record.seq))
     raw_hash = hashlib.sha256(clean_seq.encode('ascii')).digest()
-    return base64.urlsafe_b64encode(raw_hash).decode().rstrip("="), quote(record.id, safe = "-_")
+    name = record.description if desc else record.id
+    return base64.urlsafe_b64encode(raw_hash).decode().rstrip("="), quote(name, safe = "-_")
 
 def download_file(url, output_path):
     """Downloads a file using urllib.request."""
@@ -255,7 +256,7 @@ def run_gpu_worker(batch, gpu, output_path, data_dir, model, model_path, log, se
             output.append((seq_hash, seq_quote, record, output_cif))
         return output
 
-def launch_run(input_fasta, output_dir, data_dir, model, log_file, batch_size, seed, tau, steps, gpus):
+def launch_run(input_fasta, output_dir, data_dir, model, log_file, batch_size, seed, tau, steps, gpus, desc, no_cache):
 
     assert gpus, "No GPUs allocated"
 
@@ -279,16 +280,19 @@ def launch_run(input_fasta, output_dir, data_dir, model, log_file, batch_size, s
     all_ids = set()
     with sqlite3.connect(db_path) as conn:
         for record in SeqIO.parse(input_fasta, "fasta"):
-            seq_hash, seq_quote = get_hash_and_quote(record)
+            seq_hash, seq_quote = get_hash_and_quote(record, desc)
+            if seq_quote in all_ids:
+                error(f"Duplicated record id {record.id}", fatal = True)
+            all_ids.add(seq_quote)
+            if no_cache:
+                to_analyze[record.id] = seq_hash, seq_quote
+                continue
             cif = fetch_cif(conn, seq_hash, seed, tau, steps)
             if cif:
                 output_file_path = output_path / f"{seq_quote}_{seed}.cif"
                 output_file_path.write_text(cif)
             else:
                 to_analyze[record.id] = seq_hash, seq_quote
-            if record.id in all_ids:
-                error(f"Duplicated record id {record.id}", fatal = True)
-            all_ids.add(record.id)
     print(f"[✔] A total of {len(all_ids)} sequences, {len(to_analyze)} to analyze")
 
     def process_fasta():
@@ -325,11 +329,13 @@ def launch_run(input_fasta, output_dir, data_dir, model, log_file, batch_size, s
             for future in futures_done:
                 for seq_hash, seq_quote, record, output_cif in future.result():
                     if output_cif:
-                        cif = output_cif.read_text() 
-                        conn.execute("INSERT OR IGNORE INTO proteins VALUES (?, ?)", (seq_hash, str(record.seq)))
-                        conn.execute("INSERT OR IGNORE INTO simplefold VALUES (?, ?, ?, ?, ?)", (seq_hash, seed, str(tau), steps, cif))
                         successes.add(record.id)
-                conn.commit()
+                        if not no_cache:
+                            cif = output_cif.read_text() 
+                            conn.execute("INSERT OR IGNORE INTO proteins VALUES (?, ?)", (seq_hash, str(record.seq)))
+                            conn.execute("INSERT OR IGNORE INTO simplefold VALUES (?, ?, ?, ?, ?)", (seq_hash, seed, str(tau), steps, cif))
+                if not no_cache:
+                    conn.commit()
         return futures, successes
 
     ok = True
@@ -417,12 +423,14 @@ def run_cli():
     parser.add_argument("-l", "--log", type = str, help = "Raw log file")
     parser.add_argument("--tau", type = tau_arg, default = DEF_TAU, help = f"Tau [{DEF_TAU}]")
     parser.add_argument("--steps", type = int, default = DEF_STEPS, help = f"Number of steps [{DEF_STEPS}]")
+    parser.add_argument("--desc", action = 'store_true', help = "Consider the whole fasta header is the record name")
+    parser.add_argument("--no-cache", action = 'store_true', help = "Do not use cache")
     args = parser.parse_args()
     for seed in args.seeds:
         print(f"Starting with seed {seed}...")
         launch_run(
             args.input, args.output, args.data_dir, args.model, args.log,
-            batch_size = args.batch, seed = seed, tau = args.tau, steps = args.steps, gpus = args.gpus
+            batch_size = args.batch, seed = seed, tau = args.tau, steps = args.steps, desc = args.desc, gpus = args.gpus, no_cache = args.no_cache
         )
 
 def select_cli():
