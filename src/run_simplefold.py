@@ -130,13 +130,6 @@ def download_dir(url, output_path):
                 src = next(dir_path.iterdir())
                 shutil.move(str(src), str(output_path))
 
-def insert_cif_to_db(conn, seq_hash, seed, tau, steps, cif):
-    conn.execute(
-        "INSERT OR IGNORE INTO simplefold (seq_hash, seed, tau, steps, cif) VALUES (?, ?, ?, ?, ?, ?)",
-        (seq_hash, seed, str(tau), steps, cif)
-    )
-    conn.commit()
-
 # --- Initialization Logic ---
 
 def data_paths(data_dir):
