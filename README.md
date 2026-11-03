@@ -60,7 +60,7 @@ simplefold\_run
 ```
 usage: simplefold_run [-h] -i INPUT -O OUTPUT -D DATA_DIR -m {simplefold_100M,simplefold_360M,simplefold_700M,simplefold_1.1B,simplefold_1.6B,simplefold_3B} [-g GPUS] [-s SEEDS]
                       [-b BATCH] [-l LOG] [--tau TAU] [--steps STEPS] [--desc] [--no-cache] [--read-only-cache]
-                      [--max-wait MAX_WAIT]
+                      [--user-cache DIR] [--max-wait MAX_WAIT]
 
 SimpleFold wrapper: Run
 
@@ -85,6 +85,7 @@ options:
   --desc                Consider the whole fasta header is the record name
   --no-cache            Do not use cache
   --read-only-cache     Use cached structures, but do not add new ones to the cache
+  --user-cache DIR      Directory for a cache of your own, used before the cache in the data directory, which is only read
   --max-wait MAX_WAIT   Seconds to wait for a busy GPU before giving up on it [43200, i.e. 12 h]
 ```
 
@@ -95,6 +96,15 @@ With `--read-only-cache`, `simplefold_run` looks structures up in the model's da
 it can use a data directory shared by users who cannot write to it. Commits of others writing to
 the database at the same time are waited for. If a writer crashed in the middle of a write, the
 database cannot be read read-only until a run without `--read-only-cache` has rolled it back.
+
+### User cache
+
+With `--user-cache DIR`, the models are still taken from the data directory, but new structures
+are added to a database of your own, `DIR/simplefold_*.sq3`, which is created when needed.
+Structures are looked up in your database first and then in the data directory's database, which
+is only read. This way, a central data directory, e.g. one set up for the lab, can be used by
+everyone, without write access to it. `--read-only-cache` applies to your database, and
+`--no-cache` to both.
 
 ### GPU locking
 

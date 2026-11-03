@@ -17,7 +17,7 @@ from tqdm import tqdm
 import os, sys
 import queue
 import subprocess
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack, nullcontext
 import decimal
 import fcntl
 import functools
@@ -341,6 +341,9 @@ def fetch_cif(conn, seq_hash, seed, tau, steps):
 
 def init_database(model, data_dir):
     model_path, db_path = model_paths(model, data_dir)
+    create_database(db_path)
+
+def create_database(db_path):
     db_path.parent.mkdir(parents = True, exist_ok = True)
     message(f"Initializing database at {db_path}")
     with sqlite3.connect(db_path) as conn:
@@ -403,7 +406,7 @@ def run_gpu_worker(batch, gpu, output_path, data_dir, model, model_path, log, se
             output.append((seq_hash, seq_quote, record, output_cif))
         return output
 
-def launch_run(input_fasta, output_dir, data_dir, model, log_file, batch_size, seed, tau, steps, gpus, desc, no_cache, read_only_cache = False, max_wait = DEF_MAX_WAIT):
+def launch_run(input_fasta, output_dir, data_dir, model, log_file, batch_size, seed, tau, steps, gpus, desc, no_cache, read_only_cache = False, user_cache = None, max_wait = DEF_MAX_WAIT):
 
     if not gpus:
         error("No GPUs allocated", fatal = True)
@@ -419,34 +422,46 @@ def launch_run(input_fasta, output_dir, data_dir, model, log_file, batch_size, s
     output_path = Path(output_dir).resolve() / model / str(seed)
     output_path.mkdir(parents = True, exist_ok = True)
 
-    model_path, db_path = model_paths(model, data_dir)
+    model_path, central_db_path = model_paths(model, data_dir)
 
     if not Path(data_dir).exists():
         error(f"Data directory {data_dir} not found. Run 'simplefold_init' first", fatal = True)
-    if not db_path.exists():
-        error(f"Database {db_path} not found. Run 'simplefold_init -m' first", fatal = True)
     if model_path and not model_path.exists():
         error(f"Model file {model_path} not found. Run 'simplefold_init -m' first", fatal = True)
 
     # With --read-only-cache, cached structures are used, but new ones are not added
     write_cache = not no_cache and not read_only_cache
+    # With --user-cache, new structures go to the user's database, and the central one, if any,
+    # is only read. Cached structures are looked up in the user's database first.
+    if user_cache:
+        db_path = Path(user_cache).resolve() / f"{model}.sq3"
+        if write_cache and not db_path.exists():
+            create_database(db_path)
+        lookup_paths = [path for path in (db_path, central_db_path) if path.exists()]
+        if central_db_path.exists() and not os.access(central_db_path, os.R_OK):
+            warning(f"Cannot read {central_db_path}: using only {db_path}")
+            lookup_paths.remove(central_db_path)
+    else:
+        db_path = central_db_path
+        if not db_path.exists():
+            error(f"Database {db_path} not found. Run 'simplefold_init -m' first", fatal = True)
+        lookup_paths = [db_path]
     # Writing also needs the directory, for the journal
     if write_cache and not (os.access(db_path, os.W_OK) and os.access(db_path.parent, os.W_OK)):
-        error(f"Cannot write to {db_path}: use --read-only-cache", fatal = True)
+        hint = "use --read-only-cache" if user_cache else "use --user-cache or --read-only-cache"
+        error(f"Cannot write to {db_path}: {hint}", fatal = True)
 
     print(f"[*] Checking the fasta file")
     to_analyze = {}
     all_ids = set()
-    with open_cache(db_path, read_only_cache) as conn:
+    with ExitStack() as stack:
+        conns = [] if no_cache else [stack.enter_context(open_cache(path, read_only_cache or path != db_path)) for path in lookup_paths]
         for record in SeqIO.parse(input_fasta, "fasta"):
             seq_hash, seq_quote = get_hash_and_quote(record, desc)
             if seq_quote in all_ids:
                 error(f"Duplicated record id {record.id}", fatal = True)
             all_ids.add(seq_quote)
-            if no_cache:
-                to_analyze[record.id] = seq_hash, seq_quote
-                continue
-            cif = fetch_cif(conn, seq_hash, seed, tau, steps)
+            cif = next((cif for conn in conns if (cif := fetch_cif(conn, seq_hash, seed, tau, steps))), None)
             if cif:
                 output_file_path = output_path / f"{seq_quote}_{seed}.cif"
                 output_file_path.write_text(cif)
@@ -519,7 +534,7 @@ def launch_run(input_fasta, output_dir, data_dir, model, log_file, batch_size, s
 
     ok = True
     num_gpus = len(gpus)
-    with get_log(log_file) as log, TPE(max_workers = num_gpus) as executor, open_cache(db_path, read_only_cache) as conn, tqdm(total = len(to_analyze)) as progress_bar:
+    with get_log(log_file) as log, TPE(max_workers = num_gpus) as executor, (open_cache(db_path) if write_cache else nullcontext()) as conn, tqdm(total = len(to_analyze)) as progress_bar:
         all_names = set(to_analyze.keys())
         success_names = set()
         futures = set()
@@ -611,6 +626,7 @@ def run_cli():
     parser.add_argument("--desc", action = 'store_true', help = "Consider the whole fasta header is the record name")
     parser.add_argument("--no-cache", action = 'store_true', help = "Do not use cache")
     parser.add_argument("--read-only-cache", action = 'store_true', help = "Use cached structures, but do not add new ones to the cache")
+    parser.add_argument("--user-cache", metavar = "DIR", help = "Directory for a cache of your own, used before the cache in the data directory, which is only read")
     parser.add_argument("--max-wait", type = float, default = DEF_MAX_WAIT, help = f"Seconds to wait for a busy GPU before giving up on it [{DEF_MAX_WAIT}, i.e. {duration(DEF_MAX_WAIT)}]")
     args = parser.parse_args()
     if args.max_wait < 0:
@@ -620,7 +636,7 @@ def run_cli():
         launch_run(
             args.input, args.output, args.data_dir, args.model, args.log,
             batch_size = args.batch, seed = seed, tau = args.tau, steps = args.steps, desc = args.desc, gpus = args.gpus, no_cache = args.no_cache,
-            read_only_cache = args.read_only_cache, max_wait = args.max_wait
+            read_only_cache = args.read_only_cache, user_cache = args.user_cache, max_wait = args.max_wait
         )
 
 def select_cli():
