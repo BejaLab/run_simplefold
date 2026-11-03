@@ -19,6 +19,11 @@ import queue
 import subprocess
 from contextlib import contextmanager
 import decimal
+import fcntl
+import functools
+import struct
+import threading
+import time
 
 # --- Logging functions
 def message(msg):
@@ -61,6 +66,108 @@ def default_gpus():
         return [x.strip() for x in cuda_visible_devices.split(",")]
     num_gpus = get_framework_gpu_count()
     return [str(i) for i in range(num_gpus)]
+
+# --- GPU locking ---
+
+# An exclusive lock on the first byte of the device node, held while waiting for the GPU lock
+TURNSTILE = struct.pack("hhqqi", fcntl.F_WRLCK, os.SEEK_SET, 0, 1, 0)
+DEF_MAX_WAIT = 12 * 3600
+# Seconds between attempts to take a lock: a blocking lock could not give up at a deadline
+LOCK_POLL = 1
+
+class GPUWaitTimeout(Exception):
+    pass
+
+@functools.cache
+def device_node(gpu):
+    """The device node of a GPU, numbered by its minor number, which need not be its index."""
+    try:
+        out = subprocess.check_output(["nvidia-smi", "-i", str(gpu), "-q"], text = True, stderr = subprocess.STDOUT)
+    except (OSError, subprocess.CalledProcessError) as e:
+        raise RuntimeError(f"Could not query GPU {gpu} with nvidia-smi: {e}")
+    for line in out.splitlines():
+        key, _, val = line.partition(":")
+        if key.strip() == "Minor Number" and val.strip().isdigit():
+            return f"/dev/nvidia{val.strip()}"
+    raise RuntimeError(f"Could not find the device node of GPU {gpu}")
+
+def lock_holder(path):
+    """
+    The PID that took the GPU lock on the device node, if it is visible from here. The lock may
+    outlive it, held by a child it started.
+    """
+    st = os.stat(path)
+    dev = f"{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}:{st.st_ino}"
+    try:
+        with open("/proc/locks") as f:
+            for line in f:
+                # e.g. "2: FLOCK  ADVISORY  WRITE 12345 00:05:1111 0 EOF"; waiters have "->" after the number
+                fields = line.split()
+                if fields[1] == "FLOCK" and fields[5] == dev and int(fields[4]) > 0:
+                    return int(fields[4])
+    except (OSError, IndexError, ValueError):
+        pass
+    return None
+
+def duration(seconds):
+    for unit, size in (("h", 3600), ("min", 60)):
+        if seconds >= size:
+            return f"{seconds / size:.3g} {unit}"
+    return f"{seconds:.3g} s"
+
+def locked_by(path):
+    holder = lock_holder(path)
+    if holder is None:
+        return ""
+    if os.path.exists(f"/proc/{holder}"):
+        return f" (locked by PID {holder})"
+    return f" (locked by PID {holder}, which has exited, but a process it started still runs)"
+
+@contextmanager
+def gpu_lock(gpu, max_wait = DEF_MAX_WAIT):
+    """
+    Holds a GPU among the processes that take this lock, waiting while another one holds it, for
+    up to max_wait seconds, after which GPUWaitTimeout is raised.
+
+    The lock is a flock on the GPU's device node, which every process that can use the GPU sees,
+    and the kernel releases it whenever the process dies. It is compatible with the lock taken by
+    run_alphafold3 and can also be taken from the shell with `flock /dev/nvidiaN <command>`.
+
+    Yields the descriptor that holds the lock. Passed to a child with pass_fds, it keeps the GPU
+    locked until the child exits too, even if the caller dies first.
+
+    A process that has to wait first queues on a turnstile, an exclusive lock on the first byte of
+    the device node. A process that releases the GPU and wants it back has to pass the turnstile,
+    which lets the waiting process in first.
+    """
+    path = device_node(gpu)
+    lock_fd = os.open(path, os.O_RDONLY)
+    try:
+        # A write lock needs a descriptor open for writing
+        turnstile_fd = os.open(path, os.O_RDWR)
+        try:
+            deadline = time.monotonic() + max_wait
+            waiting = False
+            for take in (lambda: fcntl.fcntl(turnstile_fd, fcntl.F_OFD_SETLK, TURNSTILE),
+                         lambda: fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)):
+                while True:
+                    try:
+                        take()
+                        break
+                    except BlockingIOError:
+                        pass
+                    if time.monotonic() >= deadline:
+                        raise GPUWaitTimeout(f"GPU {gpu} is still busy{locked_by(path)} after {duration(max_wait)} of waiting")
+                    if not waiting:
+                        tqdm.write(f"[*] GPU {gpu} is busy{locked_by(path)}, waiting", file = sys.stderr)
+                        waiting = True
+                    time.sleep(LOCK_POLL)
+        finally:
+            os.close(turnstile_fd)
+        yield lock_fd
+    finally:
+        # Closing rather than unlocking: a child still holding the descriptor keeps the lock
+        os.close(lock_fd)
 
 # --- Constants ---
 MODELS = [
@@ -203,7 +310,7 @@ def launch_model(model, data_dir):
 
 # --- Inference Logic ---
 
-def run_gpu_worker(batch, gpu, output_path, data_dir, model, model_path, log, seed, tau, steps):
+def run_gpu_worker(batch, gpu, output_path, data_dir, model, model_path, log, seed, tau, steps, max_wait):
 
     data_path, ckpt_path, torch_path, cache_path, sf_repo_path, esm_ckpt_path, esm_repo_path, latent_path, plddt_path = data_paths(data_dir)
     
@@ -229,6 +336,8 @@ def run_gpu_worker(batch, gpu, output_path, data_dir, model, model_path, log, se
         for seq_hash, basename, rec in batch:
             SeqIO.write(rec, fasta_path / f"{basename}.fasta", "fasta")
         env = os.environ.copy()
+        # Number the GPUs as nvidia-smi does, so that the locked device is the one used
+        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         env["CUDA_VISIBLE_DEVICES"] = str(gpu)
         env["TORCH_HOME"] = str(torch_path)
         cmd = [
@@ -237,7 +346,9 @@ def run_gpu_worker(batch, gpu, output_path, data_dir, model, model_path, log, se
             "--plddt", "--seed", str(seed), "--fasta_path", fasta_path.name,
             "--output_dir", pred_path.name, "--ckpt_dir", ckpt_path.name
         ]
-        subprocess.run(cmd, env = env, check = True, cwd = tmp_path, stdout = log, stderr = log)
+        # The child inherits the lock, so that the GPU stays locked while it runs, even if we die
+        with gpu_lock(gpu, max_wait) as lock_fd:
+            subprocess.run(cmd, env = env, check = True, cwd = tmp_path, stdout = log, stderr = log, pass_fds = [lock_fd])
         output = []
         for seq_hash, seq_quote, record in batch:
             generated_cif = pred_path / f"predictions_{model}" / f"{seq_quote}_sampled_0.cif"
@@ -249,9 +360,15 @@ def run_gpu_worker(batch, gpu, output_path, data_dir, model, model_path, log, se
             output.append((seq_hash, seq_quote, record, output_cif))
         return output
 
-def launch_run(input_fasta, output_dir, data_dir, model, log_file, batch_size, seed, tau, steps, gpus, desc, no_cache):
+def launch_run(input_fasta, output_dir, data_dir, model, log_file, batch_size, seed, tau, steps, gpus, desc, no_cache, max_wait = DEF_MAX_WAIT):
 
-    assert gpus, "No GPUs allocated"
+    if not gpus:
+        error("No GPUs allocated", fatal = True)
+    try:
+        for gpu in gpus:
+            device_node(gpu)
+    except RuntimeError as e:
+        error(str(e), fatal = True)
 
     if not check_tau(tau):
         error(f"--tau must be a non-negative decimal number with at most two digits after the dot", fatal = True)
@@ -301,18 +418,34 @@ def launch_run(input_fasta, output_dir, data_dir, model, log_file, batch_size, s
         if to_predict:
             yield to_predict
 
+    # Free GPUs; None once every GPU has been given up on
     gpu_queue = queue.Queue()
     for gpu in gpus:
         gpu_queue.put(gpu)
+    gpus_left = [len(gpus)]
+    gpus_left_lock = threading.Lock()
 
     def wrapper(batch, log):
-        gpu = gpu_queue.get()
-        try:
-            return run_gpu_worker(batch, gpu, output_path, data_dir, model, model_path, log, seed, tau, steps)
-        except Exception as e:
-            error(f"Got exception", e, fatal = False)
-        finally:
+        while (gpu := gpu_queue.get()) is not None:
+            try:
+                result = run_gpu_worker(batch, gpu, output_path, data_dir, model, model_path, log, seed, tau, steps, max_wait)
+            except GPUWaitTimeout as e:
+                # Give up on this GPU and leave the batch to the others
+                error(str(e), fatal = False)
+                with gpus_left_lock:
+                    gpus_left[0] -= 1
+                    if gpus_left[0] == 0:
+                        error("Gave up on all GPUs", fatal = False)
+                        gpu_queue.put(None)
+                continue
+            except Exception:
+                gpu_queue.put(gpu)
+                raise
             gpu_queue.put(gpu)
+            return result
+        # Pass the sentinel on to the other waiting batches
+        gpu_queue.put(None)
+        return []
 
     def check_futures(futures, conn, max_num = 1):
         successes = set()
@@ -320,7 +453,11 @@ def launch_run(input_fasta, output_dir, data_dir, model, log_file, batch_size, s
         while len(futures) >= max_num:
             futures_done, futures = concurrent.futures.wait(futures, return_when = concurrent.futures.FIRST_COMPLETED)
             for future in futures_done:
-                for seq_hash, seq_quote, record, output_cif in future.result():
+                try:
+                    output = future.result()
+                except Exception as e:
+                    error(f"A batch failed. Check log file.", e, fatal = True)
+                for seq_hash, seq_quote, record, output_cif in output:
                     if output_cif:
                         successes.add(record.id)
                         if not no_cache:
@@ -418,12 +555,16 @@ def run_cli():
     parser.add_argument("--steps", type = int, default = DEF_STEPS, help = f"Number of steps [{DEF_STEPS}]")
     parser.add_argument("--desc", action = 'store_true', help = "Consider the whole fasta header is the record name")
     parser.add_argument("--no-cache", action = 'store_true', help = "Do not use cache")
+    parser.add_argument("--max-wait", type = float, default = DEF_MAX_WAIT, help = f"Seconds to wait for a busy GPU before giving up on it [{DEF_MAX_WAIT}, i.e. {duration(DEF_MAX_WAIT)}]")
     args = parser.parse_args()
+    if args.max_wait < 0:
+        parser.error("--max-wait must not be negative")
     for seed in args.seeds:
         print(f"Starting with seed {seed}...")
         launch_run(
             args.input, args.output, args.data_dir, args.model, args.log,
-            batch_size = args.batch, seed = seed, tau = args.tau, steps = args.steps, desc = args.desc, gpus = args.gpus, no_cache = args.no_cache
+            batch_size = args.batch, seed = seed, tau = args.tau, steps = args.steps, desc = args.desc, gpus = args.gpus, no_cache = args.no_cache,
+            max_wait = args.max_wait
         )
 
 def select_cli():

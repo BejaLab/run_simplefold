@@ -49,8 +49,8 @@ simplefold\_run
 ---------------
 
 ```
-usage: simplefold_run [-h] -i INPUT -O OUTPUT -D DATA_DIR -m {simplefold_100M,simplefold_360M,simplefold_700M,simplefold_1.1B,simplefold_1.6B,simplefold_3B} [-g GPUS] [-s SEED]
-                      [-b BATCH] [-l LOG] [--tau TAU] [--steps STEPS]
+usage: simplefold_run [-h] -i INPUT -O OUTPUT -D DATA_DIR -m {simplefold_100M,simplefold_360M,simplefold_700M,simplefold_1.1B,simplefold_1.6B,simplefold_3B} [-g GPUS] [-s SEEDS]
+                      [-b BATCH] [-l LOG] [--tau TAU] [--steps STEPS] [--desc] [--no-cache] [--max-wait MAX_WAIT]
 
 SimpleFold wrapper: Run
 
@@ -64,14 +64,32 @@ options:
                         Base directory for data
   -m simplefold_{100M,360M,700M,1.1B,1.6B,3B}, --model simplefold_{100M,360M,700M,1.1B,1.6B,3B}
                         Model name to use for inference
-  -g GPUS, --gpus GPUS  GPU indices to use
-  -s SEED, --seed SEED  Seed
+  -g GPUS, --gpus GPUS  GPUs to use
+  -s SEEDS, --seeds SEEDS
+                        Seeds
   -b BATCH, --batch BATCH
                         Batch size
   -l LOG, --log LOG     Raw log file
   --tau TAU
   --steps STEPS
+  --desc                Consider the whole fasta header is the record name
+  --no-cache            Do not use cache
+  --max-wait MAX_WAIT   Seconds to wait for a busy GPU before giving up on it [43200, i.e. 12 h]
 ```
+
+### GPU locking
+
+Each batch locks its GPU, so that runs started at the same time, from any data directory, by any
+user, take turns on a GPU instead of running out of memory: a batch on a GPU that is busy waits
+for it, with a message naming the PID that locked it. The lock is a `flock` on the GPU's device
+node (e.g. `/dev/nvidia0`), the same one taken by
+[run\_alphafold3](https://github.com/BejaLab/run_alphafold3), so SimpleFold and AlphaFold3 runs
+share the GPUs, and any other command can take part with `flock /dev/nvidia0 <command>`. The lock
+is released between batches, and a run waiting for the GPU gets it before the run that released
+it takes it again, so that a short run does not wait for a long one to finish. After `--max-wait`
+seconds of waiting, the run gives up on the GPU and leaves its batches to the other GPUs; sequences
+left when every GPU has been given up on fail. SimpleFold inherits the lock: the GPU stays locked
+while it runs, even if the wrapper dies. GPU indices follow `nvidia-smi` (`CUDA_DEVICE_ORDER=PCI_BUS_ID`).
 
 simplefold\_select
 ------------------
