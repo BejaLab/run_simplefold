@@ -310,6 +310,10 @@ def launch_model(model, data_dir):
 
 # --- Inference Logic ---
 
+def simplefold_exe():
+    """SimpleFold's executable from the environment we run in, which need not be activated."""
+    return shutil.which("simplefold", path = os.path.dirname(sys.executable)) or "simplefold"
+
 def run_gpu_worker(batch, gpu, output_path, data_dir, model, model_path, log, seed, tau, steps, max_wait):
 
     data_path, ckpt_path, torch_path, cache_path, sf_repo_path, esm_ckpt_path, esm_repo_path, latent_path, plddt_path = data_paths(data_dir)
@@ -341,7 +345,7 @@ def run_gpu_worker(batch, gpu, output_path, data_dir, model, model_path, log, se
         env["CUDA_VISIBLE_DEVICES"] = str(gpu)
         env["TORCH_HOME"] = str(torch_path)
         cmd = [
-            "simplefold", "--simplefold_model", model, "--num_steps", str(steps),
+            simplefold_exe(), "--simplefold_model", model, "--num_steps", str(steps),
             "--tau", str(tau), "--nsample_per_protein", "1", "--backend", "torch",
             "--plddt", "--seed", str(seed), "--fasta_path", fasta_path.name,
             "--output_dir", pred_path.name, "--ckpt_dir", ckpt_path.name
