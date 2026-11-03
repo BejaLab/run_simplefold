@@ -50,7 +50,8 @@ simplefold\_run
 
 ```
 usage: simplefold_run [-h] -i INPUT -O OUTPUT -D DATA_DIR -m {simplefold_100M,simplefold_360M,simplefold_700M,simplefold_1.1B,simplefold_1.6B,simplefold_3B} [-g GPUS] [-s SEEDS]
-                      [-b BATCH] [-l LOG] [--tau TAU] [--steps STEPS] [--desc] [--no-cache] [--max-wait MAX_WAIT]
+                      [-b BATCH] [-l LOG] [--tau TAU] [--steps STEPS] [--desc] [--no-cache] [--read-only-cache]
+                      [--max-wait MAX_WAIT]
 
 SimpleFold wrapper: Run
 
@@ -74,8 +75,17 @@ options:
   --steps STEPS
   --desc                Consider the whole fasta header is the record name
   --no-cache            Do not use cache
+  --read-only-cache     Use cached structures, but do not add new ones to the cache
   --max-wait MAX_WAIT   Seconds to wait for a busy GPU before giving up on it [43200, i.e. 12 h]
 ```
+
+### Read-only cache
+
+With `--read-only-cache`, `simplefold_run` looks structures up in the model's database
+(`databases/simplefold_*.sq3`) as usual but never writes to it, and opens it read-only, so that
+it can use a data directory shared by users who cannot write to it. Commits of others writing to
+the database at the same time are waited for. If a writer crashed in the middle of a write, the
+database cannot be read read-only until a run without `--read-only-cache` has rolled it back.
 
 ### GPU locking
 

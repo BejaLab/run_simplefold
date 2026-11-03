@@ -288,6 +288,20 @@ def launch_init(data_dir):
 
     print("[✔] General initialization complete.")
 
+def open_cache(db_path, read_only = False):
+    """
+    Connects to a cache database. A read-only connection never writes to it, but waits for the
+    commits of others writing to it at the same time.
+    """
+    if not read_only:
+        return sqlite3.connect(db_path)
+    conn = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri = True, timeout = 30)
+    try:
+        conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    except sqlite3.OperationalError as e:
+        error(f"Cannot read {db_path} read-only ({e}). A writer that crashed may have left a journal, which only a writer can roll back: run once without --read-only-cache", fatal = True)
+    return conn
+
 def fetch_cif(conn, seq_hash, seed, tau, steps):
     found = conn.execute("SELECT cif FROM simplefold WHERE seq_hash = ? AND seed = ? AND tau = ? AND steps = ?", (seq_hash, seed, str(tau), steps)).fetchone()
     return found[0] if found else None
@@ -364,7 +378,7 @@ def run_gpu_worker(batch, gpu, output_path, data_dir, model, model_path, log, se
             output.append((seq_hash, seq_quote, record, output_cif))
         return output
 
-def launch_run(input_fasta, output_dir, data_dir, model, log_file, batch_size, seed, tau, steps, gpus, desc, no_cache, max_wait = DEF_MAX_WAIT):
+def launch_run(input_fasta, output_dir, data_dir, model, log_file, batch_size, seed, tau, steps, gpus, desc, no_cache, read_only_cache = False, max_wait = DEF_MAX_WAIT):
 
     if not gpus:
         error("No GPUs allocated", fatal = True)
@@ -389,10 +403,16 @@ def launch_run(input_fasta, output_dir, data_dir, model, log_file, batch_size, s
     if model_path and not model_path.exists():
         error(f"Model file {model_path} not found. Run 'simplefold_init -m' first", fatal = True)
 
+    # With --read-only-cache, cached structures are used, but new ones are not added
+    write_cache = not no_cache and not read_only_cache
+    # Writing also needs the directory, for the journal
+    if write_cache and not (os.access(db_path, os.W_OK) and os.access(db_path.parent, os.W_OK)):
+        error(f"Cannot write to {db_path}: use --read-only-cache", fatal = True)
+
     print(f"[*] Checking the fasta file")
     to_analyze = {}
     all_ids = set()
-    with sqlite3.connect(db_path) as conn:
+    with open_cache(db_path, read_only_cache) as conn:
         for record in SeqIO.parse(input_fasta, "fasta"):
             seq_hash, seq_quote = get_hash_and_quote(record, desc)
             if seq_quote in all_ids:
@@ -464,17 +484,17 @@ def launch_run(input_fasta, output_dir, data_dir, model, log_file, batch_size, s
                 for seq_hash, seq_quote, record, output_cif in output:
                     if output_cif:
                         successes.add(record.id)
-                        if not no_cache:
+                        if write_cache:
                             cif = output_cif.read_text() 
                             conn.execute("INSERT OR IGNORE INTO proteins VALUES (?, ?)", (seq_hash, str(record.seq)))
                             conn.execute("INSERT OR IGNORE INTO simplefold VALUES (?, ?, ?, ?, ?)", (seq_hash, seed, str(tau), steps, cif))
-                if not no_cache:
+                if write_cache:
                     conn.commit()
         return futures, successes
 
     ok = True
     num_gpus = len(gpus)
-    with get_log(log_file) as log, TPE(max_workers = num_gpus) as executor, sqlite3.connect(db_path) as conn, tqdm(total = len(to_analyze)) as progress_bar:
+    with get_log(log_file) as log, TPE(max_workers = num_gpus) as executor, open_cache(db_path, read_only_cache) as conn, tqdm(total = len(to_analyze)) as progress_bar:
         all_names = set(to_analyze.keys())
         success_names = set()
         futures = set()
@@ -559,6 +579,7 @@ def run_cli():
     parser.add_argument("--steps", type = int, default = DEF_STEPS, help = f"Number of steps [{DEF_STEPS}]")
     parser.add_argument("--desc", action = 'store_true', help = "Consider the whole fasta header is the record name")
     parser.add_argument("--no-cache", action = 'store_true', help = "Do not use cache")
+    parser.add_argument("--read-only-cache", action = 'store_true', help = "Use cached structures, but do not add new ones to the cache")
     parser.add_argument("--max-wait", type = float, default = DEF_MAX_WAIT, help = f"Seconds to wait for a busy GPU before giving up on it [{DEF_MAX_WAIT}, i.e. {duration(DEF_MAX_WAIT)}]")
     args = parser.parse_args()
     if args.max_wait < 0:
@@ -568,7 +589,7 @@ def run_cli():
         launch_run(
             args.input, args.output, args.data_dir, args.model, args.log,
             batch_size = args.batch, seed = seed, tau = args.tau, steps = args.steps, desc = args.desc, gpus = args.gpus, no_cache = args.no_cache,
-            max_wait = args.max_wait
+            read_only_cache = args.read_only_cache, max_wait = args.max_wait
         )
 
 def select_cli():
