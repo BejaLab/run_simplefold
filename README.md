@@ -19,7 +19,7 @@ How to use
 
 ```
 #
-# Initialize the model files and the database
+# Initialize the model files and the database (or -m all for all the models)
 simplefold_init -D data_dir -m simplefold_360M
 #
 # Run the inference using a set of seeds
@@ -33,7 +33,7 @@ simplefold\_init
 ----------------
 
 ```
-usage: simplefold_init [-h] -D DATA_DIR [-m {simplefold_100M,simplefold_360M,simplefold_700M,simplefold_1.1B,simplefold_1.6B,simplefold_3B}]
+usage: simplefold_init [-h] -D DATA_DIR [-m MODELS]
 
 SimpleFold wrapper: Initialize
 
@@ -41,9 +41,18 @@ options:
   -h, --help            show this help message and exit
   -D DATA_DIR, --data-dir DATA_DIR
                         Base directory for data
-  -m {simplefold_100M,simplefold_360M,simplefold_700M,simplefold_1.1B,simplefold_1.6B,simplefold_3B}, --model {simplefold_100M,simplefold_360M,simplefold_700M,simplefold_1.1B,simplefold_1.6B,simplefold_3B}
-                        Model name (optional)
+  -m MODELS, --models MODELS
+                        Models to set up, comma-separated, or all
+                        (simplefold_100M, simplefold_360M, simplefold_700M,
+                        simplefold_1.1B, simplefold_1.6B, simplefold_3B)
+                        (optional)
 ```
+
+Downloads the files shared by all the models (the latent model `simplefold_1.6B`, the pLDDT
+module, ESM-2 3B and Boltz-1's CCD and conformer data) and the checkpoints of the given models, in
+parallel, and creates an empty cache database for each of the given models. Files that are already
+present are skipped, and a file is written under a temporary name until it is complete, so that a
+failed or interrupted `simplefold_init` can simply be run again.
 
 simplefold\_run
 ---------------

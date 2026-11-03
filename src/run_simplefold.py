@@ -211,31 +211,46 @@ def get_hash_and_quote(record, desc):
     return base64.urlsafe_b64encode(raw_hash).decode().rstrip("="), quote(name, safe = "-_")
 
 def download_file(url, output_path):
-    """Downloads a file using urllib.request."""
-    if not output_path.exists():
-        output_path.parent.mkdir(parents = True, exist_ok = True)
-        print(f"[*] Downloading: {url} -> {output_path}")
+    """
+    Downloads a file, unless it exists. The file is written under a temporary name and renamed
+    when complete, so that an interrupted download is not taken for a complete one.
+    """
+    if output_path.exists():
+        return
+    output_path.parent.mkdir(parents = True, exist_ok = True)
+    message(f"Downloading: {url} -> {output_path}")
+    with tempfile.NamedTemporaryFile(dir = output_path.parent, prefix = f".{output_path.name}.", suffix = ".part", delete = False) as out_file:
+        part_path = Path(out_file.name)
         try:
-            with urllib.request.urlopen(url) as response, open(output_path, 'wb') as out_file:
+            with urllib.request.urlopen(url) as response:
+                expected = response.headers.get("Content-Length")
                 shutil.copyfileobj(response, out_file)
-        except Exception as e:
-            if output_path.exists():
-                output_path.unlink()
-            print(f"[!] Failed to download {url}: {e}")
-            raise e
+            if expected is not None and out_file.tell() != int(expected):
+                raise IOError(f"got {out_file.tell()} bytes instead of {expected}")
+        except BaseException:
+            part_path.unlink(missing_ok = True)
+            raise
+    part_path.chmod(0o644)
+    os.replace(part_path, output_path)
 
 def download_dir(url, output_path):
-    if not output_path.exists():
-        output_path.parent.mkdir(parents = True, exist_ok = True)
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            zip_path = tmp_path / "local.zip"
-            dir_path = tmp_path / "local"
-            download_file(url, zip_path)
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                zip_ref.extractall(dir_path)
-                src = next(dir_path.iterdir())
-                shutil.move(str(src), str(output_path))
+    """
+    Downloads and unpacks a zip archive of a single directory, unless it exists. The directory is
+    unpacked next to the destination and renamed when complete.
+    """
+    if output_path.exists():
+        return
+    output_path.parent.mkdir(parents = True, exist_ok = True)
+    with tempfile.TemporaryDirectory(dir = output_path.parent, prefix = f".{output_path.name}.") as tmp:
+        tmp_path = Path(tmp)
+        zip_path = tmp_path / "local.zip"
+        dir_path = tmp_path / "local"
+        download_file(url, zip_path)
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(dir_path)
+        src = next(dir_path.iterdir())
+        src.chmod(0o755)
+        os.rename(src, output_path)
 
 # --- Initialization Logic ---
 
@@ -257,36 +272,54 @@ def model_paths(model, data_dir):
     db_path = data_path / "databases" / f"{model}.sq3"
     return model_path, db_path
 
-def launch_init(data_dir):
-    """Phase 1: General environment setup and 1.6B latent model."""
+def model_url(model):
+    return f"https://ml-site.cdn-apple.com/models/simplefold/{model}.ckpt"
+
+def launch_init(data_dir, models = []):
+    """General environment setup, the 1.6B latent model and the models' checkpoints and databases."""
     data_path, ckpt_path, torch_path, cache_path, sf_repo_path, esm_ckpt_path, esm_repo_path, latent_path, plddt_path = data_paths(data_dir)
 
     # 2. Build General Download Queue
     file_tasks = [
-        ("https://ml-site.cdn-apple.com/models/simplefold/simplefold_1.6B.ckpt", latent_path),
+        (model_url("simplefold_1.6B"), latent_path),
         ("https://ml-site.cdn-apple.com/models/simplefold/plddt_module_1.6B.ckpt", plddt_path),
         ("https://huggingface.co/boltz-community/boltz-1/resolve/main/ccd.pkl", cache_path / "ccd.pkl"),
         ("https://huggingface.co/boltz-community/boltz-1/resolve/main/boltz1_conf.ckpt", cache_path / "boltz1_conf.ckpt"),
         ("https://dl.fbaipublicfiles.com/fair-esm/models/esm2_t36_3B_UR50D.pt", esm_ckpt_path / "esm2_t36_3B_UR50D.pt"),
         ("https://dl.fbaipublicfiles.com/fair-esm/regression/esm2_t36_3B_UR50D-contact-regression.pt", esm_ckpt_path / "esm2_t36_3B_UR50D-contact-regression.pt")
     ]
+    # simplefold_1.6B is the latent model, downloaded above
+    for model in models:
+        model_path, db_path = model_paths(model, data_dir)
+        if model_path:
+            file_tasks.append((model_url(model), model_path))
     dir_tasks = [
         ("https://github.com/apple/ml-simplefold/archive/refs/heads/main.zip", sf_repo_path),
         ("https://github.com/facebookresearch/esm/archive/refs/heads/main.zip", esm_repo_path)
     ]
     # 3. Parallel Downloads for General Init
-    print(f"[*] Starting General Init parallel downloads...")
+    message("Starting parallel downloads...")
     with TPE(max_workers = len(file_tasks) + len(dir_tasks)) as executor:
-        futures = []
+        futures = {}
         for url, target in file_tasks:
-            futures.append(executor.submit(download_file, url, target))
+            futures[executor.submit(download_file, url, target)] = url
         for url, target in dir_tasks:
-            futures.append(executor.submit(download_dir, url, target))
+            futures[executor.submit(download_dir, url, target)] = url
+        failed = []
         with tqdm(total = len(file_tasks) + len(dir_tasks), leave = True) as progress:
             for future in concurrent.futures.as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    failed.append(futures[future])
+                    error(f"Failed to download {futures[future]}", e, fatal = False)
                 progress.update(1)
+    if failed:
+        error(f"{len(failed)} download(s) failed. Run simplefold_init again to retry them", fatal = True)
 
-    print("[✔] General initialization complete.")
+    for model in models:
+        init_database(model, data_dir)
+    ok("Initialization complete" + (f": {', '.join(models)}" if models else ""))
 
 def open_cache(db_path, read_only = False):
     """
@@ -306,21 +339,13 @@ def fetch_cif(conn, seq_hash, seed, tau, steps):
     found = conn.execute("SELECT cif FROM simplefold WHERE seq_hash = ? AND seed = ? AND tau = ? AND steps = ?", (seq_hash, seed, str(tau), steps)).fetchone()
     return found[0] if found else None
 
-def launch_model(model, data_dir):
+def init_database(model, data_dir):
     model_path, db_path = model_paths(model, data_dir)
-    model_path.parent.mkdir(parents = True, exist_ok = True)
     db_path.parent.mkdir(parents = True, exist_ok = True)
-
-    print(f"[*] Initializing database at {db_path}")
+    message(f"Initializing database at {db_path}")
     with sqlite3.connect(db_path) as conn:
         conn.execute("CREATE TABLE IF NOT EXISTS simplefold (seq_hash TEXT, seed INT, tau DECIMAL(5,2), steps INT, cif TEXT, PRIMARY KEY (seq_hash, seed, tau, steps))")
         conn.execute("CREATE TABLE IF NOT EXISTS proteins (seq_hash TEXT PRIMARY KEY, seq TEXT UNIQUE NOT NULL)")
-
-    if model_path and not model_path.exists():
-        url = f"https://ml-site.cdn-apple.com/models/simplefold/{model}.ckpt"
-        download_file(url, model_path)
-
-    print(f"[✔] Model init complete: {model}")
 
 # --- Inference Logic ---
 
@@ -546,13 +571,19 @@ def launch_select(input_dir, output_dir, soft_link, no_seed_suffix = False):
 # --- CLI Entries ---
 
 def init_cli():
+    def models_arg(arg):
+        if arg.strip() == "all":
+            return MODELS
+        models = [x.strip() for x in arg.split(',')]
+        for model in models:
+            if model not in MODELS:
+                raise argparse.ArgumentTypeError(f"unknown model {model} (choose from {', '.join(MODELS)} or all)")
+        return list(dict.fromkeys(models))
     parser = argparse.ArgumentParser(description = "SimpleFold wrapper: Initialize")
     parser.add_argument("-D", "--data-dir", required = True, help = "Base directory for data")
-    parser.add_argument("-m", "--model", choices = MODELS, help = "Model name (optional)")
+    parser.add_argument("-m", "--models", type = models_arg, default = [], help = f"Models to set up, comma-separated, or all ({', '.join(MODELS)}) (optional)")
     args = parser.parse_args()
-    launch_init(args.data_dir)
-    if args.model:
-        launch_model(args.model, args.data_dir)
+    launch_init(args.data_dir, args.models)
 
 def run_cli():
     def list_of_int_arg(arg):
